@@ -1,0 +1,91 @@
+#! /bin/bash
+
+IFS=$'\n'
+export LC_ALL=C
+
+# Prevent elfutils from trying to download debuginfos
+unset DEBUGINFOD_URLS
+
+
+for module in $(grep -E '/lib/modules/.+\.ko(\.gz|\.bz2|\.xz|\.zst)?$') "$@"; do
+    dep_pfx="ksym"
+    # For built-in kmods, "kernel()" syntax is used instead of "ksym()"
+    printf "%s" "$module" | grep -v "^${RPM_BUILD_ROOT}/\?lib/modules/[1-9][^/]*/kernel" > /dev/null \
+        || dep_pfx="kernel"
+
+    tmpfile=""
+    if [ "x${module%.ko}" = "x${module}" ]; then
+        tmpfile=$(mktemp -t ${0##*/}.XXXXXX.ko)
+        proc_bin=
+        case "${module##*.}" in
+        zst)
+                proc_bin=zstd
+                ;;
+        xz)
+                proc_bin=xz
+                ;;
+        bz2)
+                proc_bin=bzip2
+                ;;
+        gz)
+                proc_bin=gzip
+                ;;
+        esac
+
+        [ -n "$proc_bin" ] || continue
+
+        "$proc_bin" -d -c - < "$module" > "$tmpfile" || continue
+        module="$tmpfile"
+    fi
+
+    # awk script return code:
+    #   0 - absolute __crc_* symbols have been found, output has been
+    #       generated;
+    #   23 - a non-absolute __crc_* symbold has been found;
+    #   42 - no __crc_* symbols have been found.
+    nm "$module" \
+    | awk \
+       -v 'dep_pfx='"$dep_pfx" \
+       --non-decimal-data \
+       'BEGIN { exit_code = 42 }
+       match($0, /^([0-9a-f]+) (.) __crc_(.+)/, a) {
+           if (a[2] == "A") {
+               printf("%s(%s) = 0x%08x\n", dep_pfx, a[3], strtonum("0x" a[1]));
+               exit_code = 0;
+           } else {
+               exit_code = 23;
+               exit;
+           }
+       }
+       END { exit exit_code }'
+
+    [ 23 = "$?" ] && {
+        kmod_elf_hdr="$(readelf -h "$module")"
+        [ "x$kmod_elf_hdr" = "x${kmod_elf_hdr%Data:*little endian*}" ]
+        revbytes="$?"
+
+        objdump -t "$module" \
+        | awk \
+          -v 'dep_pfx='"$dep_pfx" \
+          -v 'module='"$module" \
+          -v 'revbytes='"$revbytes" \
+          --non-decimal-data \
+          'function readsect(name,   a, t) {
+              a = "";
+              while (("readelf -R \"" name "\" \"" module "\"" | getline t) > 0) {
+                  if (match(t, /^  0x[0-9a-f]{8}/))
+                      a = a substr(t, 14, 8) substr(t, 23, 8) substr(t, 32, 8) substr(t, 41, 8);
+              }
+              if (revbytes) { a = gensub(/(..)(..)(..)(..)/, "\\4\\3\\2\\1", "g", a); }
+              sectdata[name] = a;
+          }
+
+          match($0, /^([0-9a-f]+) [gl]...... (.*)	[0-9a-f]+ __crc_(.*)$/, a) {
+              if (!(a[2] in sectdata)) { readsect(a[2]) }
+              printf("%s(%s) = 0x%08s\n", dep_pfx, a[3], substr(sectdata[a[2]], (strtonum("0x" a[1]) * 2) + 1, 8))
+          }'
+    }
+
+    [ -z "$tmpfile" ] || rm -f -- "$tmpfile"
+done \
+| sort -k1,1 -u
