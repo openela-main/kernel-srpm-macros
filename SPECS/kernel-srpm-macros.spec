@@ -1,6 +1,6 @@
 Name:           kernel-srpm-macros
 Version:        1.0
-Release:        12%{?dist}
+Release:        13%{?dist}
 Summary:        RPM macros that list arches the full kernel is built on
 # This package only exist in Fedora repositories
 # The license is the standard (MIT) specified in
@@ -134,6 +134,20 @@ install -p -m 644 -t "%{buildroot}%{_fileattrsdir}" modalias.attr
 %{rrcdir}/find-provides.d/modalias.prov
 
 %changelog
+* Mon Jun 12 2023 Eugene Syromiatnikov <esyr@redhat.com> - 1.0-13
+- Handle symvers.xz in kabi.attr (#2209253).
+- Fix indirect __crc_* sumbols parsing in find-provides.ksyms
+  and find-requires.ksyms to avoid matching multiple sections
+  producing bogus duplicate provides for kmods that have both __kcrctab
+  and __kcrctab_gpl sections (#2115811, #2178935).
+- Call "readelf -R" on a correct section in find-requires.ksyms.
+- Rewrite section data extraction in find-provides.ksyms and find-requires.ksyms
+  to avoid garbage at the end of extracted sections, causing unnecessary awk
+  complaints (#2115811).
+- Perform section parsing inside the awk script in find-provides.ksyms
+  and find-requires.ksyms to avoid hitting command line argument limit
+  when handling large .rodata sections (#2178935).
+
 * Tue Jan 31 2023 Eugene Syromiatnikov <esyr@redhat.com> - 1.0-12
 - Support storing of __crc_* symbols in sections other than .rodata.
 - Resolves: #2135047

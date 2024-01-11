@@ -6,6 +6,11 @@
 # provided by an external module and "ksym" replaces th regular "kernel" dep.
 
 IFS=$'\n'
+export LC_ALL=C
+
+# Prevent elfutils from trying to download debuginfos
+unset DEBUGINFOD_URLS
+
 
 # Extract all of the symbols provided by this module.
 all_provides() {
@@ -35,38 +40,57 @@ all_provides() {
             module="$tmpfile"
         fi
 
-        if nm "$module" | grep -qE '^([0-9a-f]+) A __crc_(.+)' 2> /dev/null; then
-            nm "$module" \
-            | awk \
-               -v 'dep_pfx='"$dep_pfx" \
-               --non-decimal-data \
-              'match($0, /^([0-9a-f]+) A __crc_(.+)/, a) { printf("%s(%s) = 0x%08x\n", dep_pfx, a[2], strtonum("0x" a[1])) }'
-        else
+        # awk script return code:
+        #   0 - absolute __crc_* symbols have been found, output has been
+        #       generated;
+        #   23 - a non-absolute __crc_* symbold has been found;
+        #   42 - no __crc_* symbols have been found.
+        nm "$module" \
+        | awk \
+           -v 'dep_pfx='"$dep_pfx" \
+           --non-decimal-data \
+           'BEGIN { exit_code = 42 }
+           match($0, /^([0-9a-f]+) (.) __crc_(.+)/, a) {
+               if (a[2] == "A") {
+                   printf("%s(%s) = 0x%08x\n", dep_pfx, a[3], strtonum("0x" a[1]));
+                   exit_code = 0;
+               } else {
+                   exit_code = 23;
+                   exit;
+               }
+           }
+           END { exit exit_code }'
+
+        [ 23 = "$?" ] && {
+            kmod_elf_hdr="$(readelf -h "$module")"
+            [ "x$kmod_elf_hdr" = "x${kmod_elf_hdr%Data:*little endian*}" ]
+            revbytes="$?"
+
             objdump -t "$module" \
-            | sed -n 's/^[0-9a-f][0-9a-f]* g...... \(.*\)	[0-9a-f][0-9a-f]* __crc_.*$/\1/p' \
-            | sort -u \
-            | while read sectname; do
-                [ -n "$sectname" ] || continue
+            | awk \
+              -v 'dep_pfx='"$dep_pfx" \
+              -v 'module='"$module" \
+              -v 'revbytes='"$revbytes" \
+              --non-decimal-data \
+              'function readsect(name,   a, t) {
+                  a = "";
+                  while (("readelf -R \"" name "\" \"" module "\"" | getline t) > 0) {
+                      if (match(t, /^  0x[0-9a-f]{8}/))
+                          a = a substr(t, 14, 8) substr(t, 23, 8) substr(t, 32, 8) substr(t, 41, 8);
+                  }
+                  if (revbytes) { a = gensub(/(..)(..)(..)(..)/, "\\4\\3\\2\\1", "g", a); }
+                  sectdata[name] = a;
+              }
 
-                ELFSECTDATA=$(readelf -R .rodata "$module" | awk '/0x/{printf $2$3$4$5}')
-                if [[ -n $(readelf -h "$module" | grep "little endian") ]]; then
-                    SECTDATA=$(echo $ELFSECTDATA | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/g')
-                else
-                    SECTDATA=$ELFSECTDATA
-                fi
-
-                objdump -t "$module" \
-                | awk \
-                  -v 'dep_pfx='"$dep_pfx" \
-                  -v 'sectdata='"$SECTDATA" \
-                  --non-decimal-data \
-                  'match($0, /^([0-9a-f]+) g...... .*	[0-9a-f]+ __crc_(.*)$/, a) { printf("%s(%s) = 0x%08s\n", dep_pfx, a[2], substr(sectdata, (strtonum("0x" a[1]) * 2) + 1, 8)) }'
-            done
-        fi
+              match($0, /^([0-9a-f]+) [gl]...... (.*)	[0-9a-f]+ __crc_(.*)$/, a) {
+                  if (!(a[2] in sectdata)) { readsect(a[2]) }
+                  printf("%s(%s) = 0x%08s\n", dep_pfx, a[3], substr(sectdata[a[2]], (strtonum("0x" a[1]) * 2) + 1, 8))
+              }'
+        }
 
         [ -z "$tmpfile" ] || rm -f -- "$tmpfile"
     done \
-    | LC_ALL=C sort -k1,1 -u
+    | sort -k1,1 -u
 }
 
 # Extract all of the requirements of this module.
@@ -79,15 +103,15 @@ all_requires() {
             {printf("%s:0x%08x\n", $2, $1)}' \
         | sed -r -e 's:$:\t'"$1"':'
     done \
-    | LC_ALL=C sort -k1,1 -u
+    | sort -k1,1 -u
 }
 
 # Filter out requirements fulfilled by the module itself.
 mod_requires() {
-    LC_ALL=C join -t $'\t' -j 1 -v 1 \
+    join -t $'\t' -j 1 -v 1 \
         <(all_requires "$@") \
         <(all_provides "$@") \
-    | LC_ALL=C sort -k1,1 -u
+    | sort -k1,1 -u
 }
 
 if ! [ -e /sbin/modinfo -a -e /sbin/modprobe ]; then
@@ -150,21 +174,21 @@ if [ ${#modules[@]} -gt 0 ]; then
         { print $2 ":" $1 }
     ' \
     | sed -r -e 's:$:\t'"$kernel"':' \
-    | LC_ALL=C sort -k1,1 -u > $symvers
+    | sort -k1,1 -u > $symvers
 
     # Symbols matching with the kernel get a "kernel" dependency
     mod_req=$(mktemp -t mod_req.XXXXX)
     mod_requires "${modules[@]}" > "$mod_req"
-    LC_ALL=C join -t $'\t' -j 1 $symvers "$mod_req" | LC_ALL=C sort -u \
+    join -t $'\t' -j 1 $symvers "$mod_req" | sort -u \
     | awk 'BEGIN { FS = "[\t:]" ; OFS = "\t" } { print "kernel(" $1 ") = " $2 }'
 
     # Symbols from elsewhere get a "ksym" dependency
-    LC_ALL=C join -t $'\t' -j 1 -v 2 $symvers "$mod_req" | LC_ALL=C sort -u \
+    join -t $'\t' -j 1 -v 2 $symvers "$mod_req" | sort -u \
     | awk 'BEGIN { FS = "[\t:]" ; OFS = "\t" } { print "ksym(" $1 ") = " $2 }'
 
     # Check kABI if the kabi-stablelists package is installed
     # Do this last so we can try to output this error at the end
-    kabi_check_symbols=($(LC_ALL=C join -t $'\t' -j 1 $symvers "$mod_req" | LC_ALL=C sort -u \
+    kabi_check_symbols=($(join -t $'\t' -j 1 $symvers "$mod_req" | sort -u \
     | awk 'BEGIN { FS = "[\t:]" ; OFS = "\t" } { print $1 }'))
     check_kabi "${kabi_check_symbols[@]}"
 fi
