@@ -1,0 +1,69 @@
+#! /bin/bash
+
+IFS=$'\n'
+export LC_ALL=C
+
+for module in $(grep -E '/lib/modules/.+\.ko(\.gz|\.bz2|\.xz|\.zst)?$') "$@"; do
+    dep_pfx="ksym"
+    # For built-in kmods, "kernel()" syntax is used instead of "ksym()"
+    printf "%s" "$module" | grep -v "^${RPM_BUILD_ROOT}/\?lib/modules/[1-9][^/]*/kernel" > /dev/null \
+        || dep_pfx="kernel"
+
+    tmpfile=""
+    if [ "x${module%.ko}" = "x${module}" ]; then
+        tmpfile=$(mktemp -t ${0##*/}.XXXXXX.ko)
+        proc_bin=
+        case "${module##*.}" in
+        zst)
+                proc_bin=zstd
+                ;;
+        xz)
+                proc_bin=xz
+                ;;
+        bz2)
+                proc_bin=bzip2
+                ;;
+        gz)
+                proc_bin=gzip
+                ;;
+        esac
+
+        [ -n "$proc_bin" ] || continue
+
+        "$proc_bin" -d -c - < "$module" > "$tmpfile" || continue
+        module="$tmpfile"
+    fi
+
+    if nm "$module" | grep -qE '^([0-9a-f]+) A __crc_(.+)' 2> /dev/null; then
+        nm "$module" \
+        | awk \
+           -v 'dep_pfx='"$dep_pfx" \
+           --non-decimal-data \
+          'match($0, /^([0-9a-f]+) A __crc_(.+)/, a) { printf("%s(%s) = 0x%08x\n", dep_pfx, a[2], strtonum("0x" a[1])) }' \
+        | sort -u
+    else
+        objdump -t "$module" \
+        | sed -n 's/^[0-9a-f][0-9a-f]* g...... \(.*\)	[0-9a-f][0-9a-f]* __crc_.*$/\1/p' \
+        | sort -u \
+        | while read sectname; do
+            [ -n "$sectname" ] || continue
+
+            ELFSECTDATA=$(readelf -R "$sectname" "$module" | awk '/0x/{printf $2$3$4$5}')
+            if [[ -n $(readelf -h $module | grep "little endian") ]]; then
+                SECTDATA=$(echo $ELFSECTDATA | sed 's/\(..\)\(..\)\(..\)\(..\)/\4\3\2\1/g')
+            else
+                SECTDATA=$ELFSECTDATA
+            fi
+
+            objdump -t "$module" \
+            | awk \
+              -v 'dep_pfx='"$dep_pfx" \
+              -v 'sectdata='"$SECTDATA" \
+              --non-decimal-data \
+              'match($0, /^([0-9a-f]+) g...... .*	[0-9a-f]+ __crc_(.*)$/, a) { printf("%s(%s) = 0x%08s\n", dep_pfx, a[2], substr(sectdata, (strtonum("0x" a[1]) * 2) + 1, 8)) }'
+        done \
+        | sort -u
+    fi
+
+    [ -z "$tmpfile" ] || rm -f -- "$tmpfile"
+done
